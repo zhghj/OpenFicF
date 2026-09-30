@@ -53,6 +53,7 @@ class _RuntimeCatalog {
   final Map<String, ToolPermissionMode> permissions;
   final int historyLimit;
   final bool compressSystemPrompts;
+  final bool compressHistory;
   bool styleSelectionConfigured;
   StyleProfile? activeStyleProfile;
   List<StyleProfile> activeStyleProfiles;
@@ -69,6 +70,7 @@ class _RuntimeCatalog {
     required this.permissions,
     required this.historyLimit,
     required this.compressSystemPrompts,
+    required this.compressHistory,
     required this.styleSelectionConfigured,
     required this.activeStyleProfile,
     required this.activeStyleProfiles,
@@ -745,6 +747,30 @@ List<StyleProfile> _latestStyleProfiles(List<StyleProfile> profiles) {
   return result;
 }
 
+/// 把超出上下文窗口的较早对话压缩成要点摘要（一次模型调用）。
+Future<String> _summarizeHistory(ModelSelection selection, List<AgentMessage> messages) async {
+  final text = messages
+      .where((message) => message.role != 'tool')
+      .map((message) => '${message.role == 'user' ? '用户' : '助手'}：${message.content.trim()}')
+      .where((line) => line.isNotEmpty)
+      .join('\n');
+  if (text.trim().isEmpty) return '';
+  final bounded = text.length > 12000 ? text.substring(text.length - 12000) : text;
+  final turn = await callModel(
+    selection,
+    [
+      AgentMessage(
+        role: 'system',
+        content: '把以下较早的创作对话压缩成要点摘要，保留已确定的设定、已做出的决定、待办事项与用户偏好，'
+            '丢弃寒暄与重复内容。不要展开，不要评价。只输出中文摘要。',
+      ),
+      AgentMessage(role: 'user', content: bounded),
+    ],
+    const [],
+  );
+  return _truncate(turn.content, 2000);
+}
+
 Future<void> _ensureWritingStyleSelection({
   required String projectId,
   required String request,
@@ -914,9 +940,20 @@ Future<_LoopResult> _runAgentLoop(_LoopInput input) async {
     consistencyReason: input.consistencyReason,
     userRequest: input.userRequest,
   );
+  // 历史超出上限时：默认截断；开启上下文压缩则把更早的消息摘要成要点保留。
   final history = input.history.length > input.catalog.historyLimit
       ? input.history.sublist(input.history.length - input.catalog.historyLimit)
       : input.history;
+  String? historySummary;
+  if (input.catalog.compressHistory && input.history.length > input.catalog.historyLimit) {
+    final overflow = input.history.sublist(0, input.history.length - input.catalog.historyLimit);
+    try {
+      final summary = await _summarizeHistory(input.selection, overflow);
+      if (summary.isNotEmpty) historySummary = summary;
+    } catch (_) {
+      // 压缩失败时退回截断，不阻塞本轮任务。
+    }
+  }
   final messages = <AgentMessage>[
     AgentMessage(
       role: 'system',
@@ -924,6 +961,8 @@ Future<_LoopResult> _runAgentLoop(_LoopInput input) async {
           ? prompt.split('\n').map((line) => line.trim()).where((line) => line.isNotEmpty).join('\n')
           : prompt,
     ),
+    if (historySummary != null)
+      AgentMessage(role: 'system', content: '较早对话摘要（已压缩，仅供参考）：\n$historySummary'),
     ...history,
   ];
   final tools = _toolsForAgent(input.agent);
@@ -1236,6 +1275,7 @@ Future<AgentRunResult> runAgent({
     getProjectControls(project.id),
     listCanonEntries(project.id, enabledOnly: true),
     isStyleSelectionConfigured(project.id),
+    getSetting('context.compressHistory'),
   ]);
   final rules = results[0] as List<AgentRule>;
   final skills = results[1] as List<AgentSkill>;
@@ -1252,6 +1292,7 @@ Future<AgentRunResult> runAgent({
   final controls = results[12] as ProjectControls;
   final canonEntries = results[13] as List<CanonEntry>;
   final styleConfigured = results[14] as bool;
+  final compressHistoryValue = results[15] as String?;
 
   final parsedHistoryLimit = int.tryParse(historyLimitValue ?? '');
   final catalog = _RuntimeCatalog(
@@ -1263,6 +1304,7 @@ Future<AgentRunResult> runAgent({
         ? parsedHistoryLimit
         : 30,
     compressSystemPrompts: compressValue == 'true',
+    compressHistory: compressHistoryValue == 'true',
     styleSelectionConfigured: styleConfigured,
     activeStyleProfile: activeStyleProfiles.isEmpty ? null : activeStyleProfiles.first,
     activeStyleProfiles: activeStyleProfiles,

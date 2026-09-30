@@ -178,6 +178,18 @@ class ModelCallOptions {
   const ModelCallOptions({this.minOutputTokens});
 }
 
+/// 模型在返回正文前就耗尽了输出 Token；调用方会据此自动放宽上限重试。
+class OutputTruncatedException implements Exception {
+  final int limit;
+  final String provider;
+
+  const OutputTruncatedException(this.limit, this.provider);
+
+  @override
+  String toString() =>
+      '$provider 在返回正文前就用完了 $limit 个输出 Token（思考型模型的推理过程也计入该上限）。';
+}
+
 int _resolveOutputTokens(ModelSelection selection, ModelCallOptions? options) {
   final configured = normalizeMaxOutputTokens(selection.model.maxTokens);
   final min = options?.minOutputTokens;
@@ -260,10 +272,7 @@ Future<ModelTurn> _callOpenAi(
   final content = message['content'] is String ? message['content'] as String : '';
   if (content.trim().isEmpty && toolCalls.isEmpty) {
     if (finishReason == 'length') {
-      throw Exception(
-        '模型在返回正文前就用完了 $maxOutputTokens 个输出 Token（finish_reason=length）。'
-        '思考型模型的推理过程也计入这个上限，请在“设置 → 模型与供应商”调高最大输出 Token 数，或换用非思考模型。',
-      );
+      throw OutputTruncatedException(maxOutputTokens, '模型');
     }
     if (finishReason.isNotEmpty && finishReason != 'stop') {
       throw Exception('模型没有返回内容，finish_reason=$finishReason');
@@ -397,10 +406,7 @@ Future<ModelTurn> _callGemini(
   final finishReason = '${candidate['finishReason'] ?? ''}';
   if (parts.isEmpty) {
     if (finishReason == 'MAX_TOKENS') {
-      throw Exception(
-        '模型在返回正文前就用完了 $maxOutputTokens 个输出 Token（finishReason=MAX_TOKENS）。'
-        '思考型模型的推理过程也计入这个上限，请在“设置 → 模型与供应商”调高最大输出 Token 数。',
-      );
+      throw OutputTruncatedException(maxOutputTokens, 'Gemini');
     }
     final promptFeedback = data['promptFeedback'];
     final reason = (promptFeedback is Map && promptFeedback['blockReason'] != null)
@@ -519,20 +525,17 @@ Future<ModelTurn> _callAnthropic(
   }
   final content = buffer.toString();
   if (content.trim().isEmpty && toolCalls.isEmpty && data['stop_reason'] == 'max_tokens') {
-    throw Exception(
-      '模型在返回正文前就用完了 $maxOutputTokens 个输出 Token（stop_reason=max_tokens）。'
-      '请在“设置 → 模型与供应商”调高最大输出 Token 数。',
-    );
+    throw OutputTruncatedException(maxOutputTokens, 'Anthropic');
   }
   return ModelTurn(content: content, toolCalls: toolCalls);
 }
 
-Future<ModelTurn> callModel(
+Future<ModelTurn> _dispatchModelCall(
   ModelSelection selection,
   List<AgentMessage> messages,
-  List<AgentToolDefinition> tools, [
+  List<AgentToolDefinition> tools,
   ModelCallOptions? options,
-]) {
+) {
   switch (selection.provider.type) {
     case ProviderType.googleGenai:
       return _callGemini(selection, messages, tools, options);
@@ -541,4 +544,30 @@ Future<ModelTurn> callModel(
     case ProviderType.openaiCompatible:
       return _callOpenAi(selection, messages, tools, options);
   }
+}
+
+/// 调用模型。若输出 Token 用尽且未产出正文，会自动放宽上限重试（最多两次），
+/// 相当于“启用模型最大输出”，避免思考型模型因推理占用而上限过低。
+Future<ModelTurn> callModel(
+  ModelSelection selection,
+  List<AgentMessage> messages,
+  List<AgentToolDefinition> tools, [
+  ModelCallOptions? options,
+]) async {
+  var effectiveOptions = options;
+  for (var attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await _dispatchModelCall(selection, messages, tools, effectiveOptions);
+    } on OutputTruncatedException catch (error) {
+      final current = _resolveOutputTokens(selection, effectiveOptions);
+      final next = (current * 2).clamp(current + 1, maxConfiguredOutputTokens);
+      if (next <= current || attempt >= 2) {
+        throw Exception(
+          '$error 已重试并放宽到上限仍不足；请在“设置 → 模型与供应商”调高该模型的最大输出 Token 数（思考型模型的推理也计入），或换用非思考模型。',
+        );
+      }
+      effectiveOptions = ModelCallOptions(minOutputTokens: next);
+    }
+  }
+  throw Exception('模型调用失败');
 }

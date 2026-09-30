@@ -183,6 +183,7 @@ class _ContextSettingsScreen extends StatefulWidget {
 class _ContextSettingsScreenState extends State<_ContextSettingsScreen> {
   final _limitController = TextEditingController(text: '30');
   bool _compress = false;
+  bool _compressHistory = false;
   bool _loading = true;
 
   @override
@@ -200,10 +201,12 @@ class _ContextSettingsScreenState extends State<_ContextSettingsScreen> {
   Future<void> _load() async {
     final limit = await getSetting('context.historyLimit');
     final compress = await getSetting('context.compressSystemPrompts');
+    final compressHistory = await getSetting('context.compressHistory');
     if (!mounted) return;
     setState(() {
       _limitController.text = limit ?? '30';
       _compress = compress == 'true';
+      _compressHistory = compressHistory == 'true';
       _loading = false;
     });
   }
@@ -217,6 +220,7 @@ class _ContextSettingsScreenState extends State<_ContextSettingsScreen> {
     await setSettings([
       ('context.historyLimit', '$limit'),
       ('context.compressSystemPrompts', '$_compress'),
+      ('context.compressHistory', '$_compressHistory'),
     ]);
     if (notify && mounted) showMessageSnack(context, '已保存');
   }
@@ -246,6 +250,15 @@ class _ContextSettingsScreenState extends State<_ContextSettingsScreen> {
                   value: _compress,
                   onChanged: (value) async {
                     setState(() => _compress = value);
+                    await _persist();
+                  },
+                ),
+                SwitchListTile(
+                  title: const Text('压缩历史对话'),
+                  subtitle: const Text('超出上面的条数时，把更早的对话摘要成要点保留，而不是直接丢弃（每次多一次模型调用）'),
+                  value: _compressHistory,
+                  onChanged: (value) async {
+                    setState(() => _compressHistory = value);
                     await _persist();
                   },
                 ),
